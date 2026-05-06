@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ─── CONFIGURATION ────────────────────────────────────────────────────────────
+IDLE_TIMEOUT_MS=300000          # idle time before screensaver starts (5 min)
+REPO_PATH="${HOME}/your-repo"   # CHANGE THIS: path to a git repo for gitlogue
+GITLOGUE=/home/linuxbrew/.linuxbrew/bin/gitlogue
+GITLOGUE_FLAGS="--order random" # extra gitlogue flags: --speed 30 --theme dracula
+POLL_INTERVAL=5                 # seconds between idle checks (waiting state)
+WAKE_POLL_INTERVAL=1            # seconds between idle checks (screensaver active)
+WAKE_THRESHOLD_MS=2000          # idle below this after screensaver = input detected
+PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/gitscrnsvr.pid"
+# ──────────────────────────────────────────────────────────────────────────────
+
+log() { logger -t gitscrnsvr -- "$*" 2>/dev/null || echo "[gitscrnsvr] $*" >&2; }
+
+get_idle_ms() {
+    local raw
+    raw=$(gdbus call --session \
+        --dest org.gnome.Mutter.IdleMonitor \
+        --object-path /org/gnome/Mutter/IdleMonitor/Core \
+        --method org.gnome.Mutter.IdleMonitor.GetIdletime 2>/dev/null) \
+        || { echo 0; return; }
+    # raw is like: (uint64 12345,)
+    raw="${raw#*(uint64 }"
+    echo "${raw%,)*}"
+}
+
+inhibit_gnome_idle() {
+    gdbus call --session \
+        --dest org.gnome.SessionManager \
+        --object-path /org/gnome/SessionManager \
+        --method org.gnome.SessionManager.Inhibit \
+        "gitscrnsvr" "uint32 0" "gitlogue screensaver running" "uint32 8" 2>/dev/null \
+        | grep -oP '(?<=uint32 )\d+' || echo ""
+}
+
+uninhibit_gnome_idle() {
+    [[ -z "${1:-}" ]] && return 0
+    gdbus call --session \
+        --dest org.gnome.SessionManager \
+        --object-path /org/gnome/SessionManager \
+        --method org.gnome.SessionManager.Uninhibit \
+        "uint32 ${1}" 2>/dev/null || true
+}
+
+launch_screensaver() {
+    log "Launching gitlogue screensaver (repo: ${REPO_PATH})"
+    # bash -c wrapper: exec replaces bash, so PID_FILE ends up with gitlogue's PID
+    gnome-terminal \
+        --full-screen --hide-menubar --title "gitscrnsvr" \
+        -- bash -c "echo \$\$ > ${PID_FILE}; exec ${GITLOGUE} --loop --path ${REPO_PATH} ${GITLOGUE_FLAGS}" &
+    local waited=0
+    while [[ ! -f "${PID_FILE}" ]] && (( waited < 50 )); do
+        sleep 0.1
+        (( waited++ ))
+    done
+    [[ ! -f "${PID_FILE}" ]] && log "WARNING: PID file not written within 5s"
+}
+
+kill_screensaver() {
+    [[ ! -f "${PID_FILE}" ]] && return 0
+    local pid
+    pid=$(cat "${PID_FILE}" 2>/dev/null || echo "")
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+        sleep 1
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "${PID_FILE}"
+}
+
+lock_and_dismiss() {
+    log "Input detected — locking screen"
+    # Lock FIRST: GNOME Shell renders the lock screen before the terminal disappears,
+    # preventing a brief desktop flash.
+    gdbus call --session \
+        --dest org.gnome.ScreenSaver \
+        --object-path /org/gnome/ScreenSaver \
+        --method org.gnome.ScreenSaver.Lock 2>/dev/null \
+        || loginctl lock-session 2>/dev/null || true
+    sleep 0.2
+    kill_screensaver
+}
+
+# ─── STARTUP VALIDATION ───────────────────────────────────────────────────────
+
+if ! git -C "$REPO_PATH" rev-parse --git-dir &>/dev/null; then
+    echo "ERROR: REPO_PATH='${REPO_PATH}' is not a git repository." >&2
+    echo "       Edit the REPO_PATH variable at the top of this script." >&2
+    exit 1
+fi
+
+if ! gdbus call --session \
+        --dest org.gnome.Mutter.IdleMonitor \
+        --object-path /org/gnome/Mutter/IdleMonitor/Core \
+        --method org.gnome.Mutter.IdleMonitor.GetIdletime &>/dev/null; then
+    echo "ERROR: Cannot reach org.gnome.Mutter.IdleMonitor via D-Bus." >&2
+    echo "       This script requires a running GNOME session." >&2
+    exit 1
+fi
+
+# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
+
+INHIBIT_COOKIE=""
+SCREENSAVER_ACTIVE=false
+
+trap 'kill_screensaver; uninhibit_gnome_idle "${INHIBIT_COOKIE}"; exit 0' \
+    EXIT SIGTERM SIGINT SIGHUP
+
+log "Started. Idle threshold: ${IDLE_TIMEOUT_MS}ms. Repo: ${REPO_PATH}"
+
+while true; do
+    idle_ms=$(get_idle_ms)
+
+    if [[ "$SCREENSAVER_ACTIVE" == "false" ]]; then
+        if (( idle_ms >= IDLE_TIMEOUT_MS )); then
+            log "Idle threshold reached (${idle_ms}ms)"
+            INHIBIT_COOKIE=$(inhibit_gnome_idle)
+            launch_screensaver
+            SCREENSAVER_ACTIVE=true
+        else
+            sleep "$POLL_INTERVAL"
+        fi
+    else
+        if (( idle_ms < WAKE_THRESHOLD_MS )); then
+            lock_and_dismiss
+            uninhibit_gnome_idle "${INHIBIT_COOKIE}"
+            INHIBIT_COOKIE=""
+            SCREENSAVER_ACTIVE=false
+            sleep 5
+        else
+            # Restart gitlogue if it crashed unexpectedly
+            if [[ -f "${PID_FILE}" ]]; then
+                local_pid=$(cat "${PID_FILE}" 2>/dev/null || echo "")
+                if [[ -n "$local_pid" ]] && ! kill -0 "$local_pid" 2>/dev/null; then
+                    log "gitlogue exited unexpectedly — restarting"
+                    rm -f "${PID_FILE}"
+                    launch_screensaver
+                fi
+            fi
+            sleep "$WAKE_POLL_INTERVAL"
+        fi
+    fi
+done
