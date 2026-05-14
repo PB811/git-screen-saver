@@ -2,17 +2,31 @@
 set -euo pipefail
 
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
-IDLE_TIMEOUT_MS=300000          # idle time before screensaver starts (5 min)
-REPO_PATH="${HOME}/your-repo"   # CHANGE THIS: path to a git repo for gitlogue
-GITLOGUE=/home/linuxbrew/.linuxbrew/bin/gitlogue
-GITLOGUE_FLAGS="--order random" # extra gitlogue flags: --speed 30 --theme dracula
-POLL_INTERVAL=5                 # seconds between idle checks (waiting state)
-WAKE_POLL_INTERVAL=1            # seconds between idle checks (screensaver active)
-WAKE_THRESHOLD_MS=2000          # idle below this after screensaver = input detected
+IDLE_TIMEOUT_MS="${IDLE_TIMEOUT_MS:-300000}"   # idle time before screensaver starts (5 min)
+REPO_PATH="${REPO_PATH:-${HOME}/Desktop/Prod/aimodels}"  # CHANGE THIS: path to a git repo for gitlogue
+GITLOGUE="${GITLOGUE:-/home/linuxbrew/.linuxbrew/bin/gitlogue}"
+GITLOGUE_FLAGS="${GITLOGUE_FLAGS:---order random}"  # extra gitlogue flags: --speed 30 --theme dracula
+POLL_INTERVAL="${POLL_INTERVAL:-5}"                # seconds between idle checks (waiting state)
+WAKE_POLL_INTERVAL="${WAKE_POLL_INTERVAL:-1}"      # seconds between idle checks (screensaver active)
+WAKE_THRESHOLD_MS="${WAKE_THRESHOLD_MS:-2000}"     # idle below this after screensaver = input detected
+LAUNCH_GRACE_SEC="${LAUNCH_GRACE_SEC:-8}"          # seconds to ignore idle reset after screensaver launch
 PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/gitscrnsvr.pid"
 # ──────────────────────────────────────────────────────────────────────────────
 
-log() { logger -t gitscrnsvr -- "$*" 2>/dev/null || echo "[gitscrnsvr] $*" >&2; }
+VERBOSE=false
+for arg in "$@"; do
+    case "$arg" in
+        -v|--verbose) VERBOSE=true ;;
+        *) echo "Unknown option: $arg" >&2; exit 1 ;;
+    esac
+done
+
+log() {
+    echo "[gitscrnsvr] $(date '+%H:%M:%S') $*" >&2
+    logger -t gitscrnsvr -- "$*" 2>/dev/null || true
+}
+
+vlog() { $VERBOSE && log "  $*" || true; }
 
 get_idle_ms() {
     local raw
@@ -20,19 +34,24 @@ get_idle_ms() {
         --dest org.gnome.Mutter.IdleMonitor \
         --object-path /org/gnome/Mutter/IdleMonitor/Core \
         --method org.gnome.Mutter.IdleMonitor.GetIdletime 2>/dev/null) \
-        || { echo 0; return; }
+        || { vlog "gdbus GetIdletime failed, defaulting to 0"; echo 0; return; }
     # raw is like: (uint64 12345,)
     raw="${raw#*(uint64 }"
-    echo "${raw%,)*}"
+    local ms="${raw%,)*}"
+    vlog "idle=${ms}ms (threshold=${IDLE_TIMEOUT_MS}ms)"
+    echo "$ms"
 }
 
 inhibit_gnome_idle() {
-    gdbus call --session \
+    local cookie
+    cookie=$(gdbus call --session \
         --dest org.gnome.SessionManager \
         --object-path /org/gnome/SessionManager \
         --method org.gnome.SessionManager.Inhibit \
         "gitscrnsvr" "uint32 0" "gitlogue screensaver running" "uint32 8" 2>/dev/null \
-        | grep -oP '(?<=uint32 )\d+' || echo ""
+        | grep -oP '(?<=uint32 )\d+' || echo "")
+    vlog "SessionManager inhibit cookie=${cookie:-none}"
+    echo "$cookie"
 }
 
 uninhibit_gnome_idle() {
@@ -46,16 +65,21 @@ uninhibit_gnome_idle() {
 
 launch_screensaver() {
     log "Launching gitlogue screensaver (repo: ${REPO_PATH})"
+    vlog "Command: ${GITLOGUE} --loop --path ${REPO_PATH} ${GITLOGUE_FLAGS}"
     # bash -c wrapper: exec replaces bash, so PID_FILE ends up with gitlogue's PID
     gnome-terminal \
         --full-screen --hide-menubar --title "gitscrnsvr" \
         -- bash -c "echo \$\$ > ${PID_FILE}; exec ${GITLOGUE} --loop --path ${REPO_PATH} ${GITLOGUE_FLAGS}" &
     local waited=0
-    while [[ ! -f "${PID_FILE}" ]] && (( waited < 50 )); do
+    while [[ ! -f "${PID_FILE}" ]] && [[ $waited -lt 50 ]]; do
         sleep 0.1
-        (( waited++ ))
+        waited=$((waited + 1))   # avoid (( )) exit-code-0 trap under set -e
     done
-    [[ ! -f "${PID_FILE}" ]] && log "WARNING: PID file not written within 5s"
+    if [[ ! -f "${PID_FILE}" ]]; then
+        log "WARNING: PID file not written within 5s — gnome-terminal may have failed"
+    else
+        vlog "gitlogue PID=$(cat ${PID_FILE})"
+    fi
 }
 
 kill_screensaver() {
@@ -85,30 +109,49 @@ lock_and_dismiss() {
 
 # ─── STARTUP VALIDATION ───────────────────────────────────────────────────────
 
+log "Validating configuration..."
+vlog "REPO_PATH=${REPO_PATH}"
+vlog "GITLOGUE=${GITLOGUE}"
+vlog "IDLE_TIMEOUT_MS=${IDLE_TIMEOUT_MS}"
+vlog "WAKE_THRESHOLD_MS=${WAKE_THRESHOLD_MS}"
+vlog "PID_FILE=${PID_FILE}"
+
+if [[ ! -x "$GITLOGUE" ]]; then
+    echo "ERROR: gitlogue not found or not executable at '${GITLOGUE}'." >&2
+    exit 1
+fi
+vlog "gitlogue binary: OK"
+
 if ! git -C "$REPO_PATH" rev-parse --git-dir &>/dev/null; then
     echo "ERROR: REPO_PATH='${REPO_PATH}' is not a git repository." >&2
     echo "       Edit the REPO_PATH variable at the top of this script." >&2
     exit 1
 fi
+vlog "git repo: OK"
 
-if ! gdbus call --session \
-        --dest org.gnome.Mutter.IdleMonitor \
-        --object-path /org/gnome/Mutter/IdleMonitor/Core \
-        --method org.gnome.Mutter.IdleMonitor.GetIdletime &>/dev/null; then
+local_idle_ms=$(gdbus call --session \
+    --dest org.gnome.Mutter.IdleMonitor \
+    --object-path /org/gnome/Mutter/IdleMonitor/Core \
+    --method org.gnome.Mutter.IdleMonitor.GetIdletime 2>&1) || {
     echo "ERROR: Cannot reach org.gnome.Mutter.IdleMonitor via D-Bus." >&2
+    echo "       D-Bus response: ${local_idle_ms}" >&2
     echo "       This script requires a running GNOME session." >&2
     exit 1
-fi
+}
+vlog "D-Bus IdleMonitor: OK (response: ${local_idle_ms})"
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
 INHIBIT_COOKIE=""
 SCREENSAVER_ACTIVE=false
+SCREENSAVER_START=0
 
 trap 'kill_screensaver; uninhibit_gnome_idle "${INHIBIT_COOKIE}"; exit 0' \
     EXIT SIGTERM SIGINT SIGHUP
 
-log "Started. Idle threshold: ${IDLE_TIMEOUT_MS}ms. Repo: ${REPO_PATH}"
+log "All checks passed. Starting main loop."
+log "Idle threshold: ${IDLE_TIMEOUT_MS}ms  |  Repo: ${REPO_PATH}"
+$VERBOSE && log "Verbose mode ON — idle time printed every poll cycle"
 
 while true; do
     idle_ms=$(get_idle_ms)
@@ -119,11 +162,15 @@ while true; do
             INHIBIT_COOKIE=$(inhibit_gnome_idle)
             launch_screensaver
             SCREENSAVER_ACTIVE=true
+            SCREENSAVER_START=$SECONDS
+            vlog "Grace period: ignoring idle resets for ${LAUNCH_GRACE_SEC}s"
         else
             sleep "$POLL_INTERVAL"
         fi
     else
-        if (( idle_ms < WAKE_THRESHOLD_MS )); then
+        local_elapsed=$(( SECONDS - SCREENSAVER_START ))
+        if (( idle_ms < WAKE_THRESHOLD_MS )) && (( local_elapsed >= LAUNCH_GRACE_SEC )); then
+            vlog "Wake detected after ${local_elapsed}s (idle=${idle_ms}ms)"
             lock_and_dismiss
             uninhibit_gnome_idle "${INHIBIT_COOKIE}"
             INHIBIT_COOKIE=""
