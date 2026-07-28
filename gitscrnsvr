@@ -1,25 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ─── CONFIGURATION ────────────────────────────────────────────────────────────
+VERSION="0.1.0"
+REPO_SLUG="PB811/git-screen-saver"
+CONFIG_FILE="${XDG_CONFIG_HOME:-${HOME}/.config}/gitscrnsvr/config.env"
+GITLOGUE_INSTALL_DOCS="https://github.com/unhappychoice/gitlogue/blob/main/docs/installation.md"
+
+# shellcheck source=/dev/null
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
 IDLE_TIMEOUT_MS="${IDLE_TIMEOUT_MS:-300000}"   # idle time before screensaver starts (5 min)
-REPO_PATH="${REPO_PATH:-${HOME}/Desktop/Prod/aimodels}"  # CHANGE THIS: path to a git repo for gitlogue
-GITLOGUE="${GITLOGUE:-/home/linuxbrew/.linuxbrew/bin/gitlogue}"
+REPO_PATH="${REPO_PATH:-${HOME}/Desktop/Prod/aimodels}"  # git repo for gitlogue; set via config.env
 GITLOGUE_FLAGS="${GITLOGUE_FLAGS:---order random}"  # extra gitlogue flags: --speed 30 --theme dracula
 POLL_INTERVAL="${POLL_INTERVAL:-5}"                # seconds between idle checks (waiting state)
 WAKE_POLL_INTERVAL="${WAKE_POLL_INTERVAL:-1}"      # seconds between idle checks (screensaver active)
 WAKE_THRESHOLD_MS="${WAKE_THRESHOLD_MS:-2000}"     # idle below this after screensaver = input detected
 LAUNCH_GRACE_SEC="${LAUNCH_GRACE_SEC:-8}"          # seconds to ignore idle reset after screensaver launch
 PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/gitscrnsvr.pid"
-# ──────────────────────────────────────────────────────────────────────────────
+VERBOSE="${VERBOSE:-false}"                        # safe default so this file can be sourced for tests
 
-VERBOSE=false
-for arg in "$@"; do
-    case "$arg" in
-        -v|--verbose) VERBOSE=true ;;
-        *) echo "Unknown option: $arg" >&2; exit 1 ;;
-    esac
-done
+# gitlogue discovery: PATH first, then every location gitlogue's own install
+# docs describe (install script, Homebrew/Linuxbrew, pacman, Cargo, manual
+# binary drop). nix run/profile installs land on PATH, so command -v covers those.
+find_gitlogue() {
+    if [[ -n "${GITLOGUE:-}" ]]; then
+        echo "$GITLOGUE"
+        return 0
+    fi
+    if command -v gitlogue &>/dev/null; then
+        command -v gitlogue
+        return 0
+    fi
+    local candidates=(
+        "${HOME}/.local/bin/gitlogue"
+        "${HOME}/.cargo/bin/gitlogue"
+        "/opt/homebrew/bin/gitlogue"
+        "/home/linuxbrew/.linuxbrew/bin/gitlogue"
+        "/usr/local/bin/gitlogue"
+        "/usr/bin/gitlogue"
+    )
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        [[ -x "$candidate" ]] && { echo "$candidate"; return 0; }
+    done
+    return 1
+}
 
 log() {
     echo "[gitscrnsvr] $(date '+%H:%M:%S') $*" >&2
@@ -28,18 +53,70 @@ log() {
 
 vlog() { $VERBOSE && log "  $*" || true; }
 
+# Pure parsing helpers, kept separate from the D-Bus/network calls that
+# produce their input so they can be unit tested without a live GNOME
+# session or network access.
+
+# "(uint64 12345,)" -> "12345"
+parse_idle_reply() {
+    local raw="$1"
+    raw="${raw#*(uint64 }"
+    echo "${raw%,)*}"
+}
+
+# "(true,)" -> "true", "(false,)" -> "false"
+parse_lock_reply() {
+    [[ "$1" == *"true"* ]] && echo true || echo false
+}
+
+# Prints whichever of two "X.Y.Z" strings is the newer version.
+newer_version() {
+    printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1
+}
+
+# Extracts "tag_name" from a GitHub releases/latest JSON body, preferring jq
+# when available and falling back to a plain grep otherwise.
+parse_release_tag() {
+    local json="$1" tag
+    if command -v jq &>/dev/null; then
+        tag=$(echo "$json" | jq -r '.tag_name // empty')
+    else
+        tag=$(echo "$json" | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
+    fi
+    echo "${tag#v}"
+}
+
+LAST_IDLE_MS=0
+
 get_idle_ms() {
     local raw
     raw=$(gdbus call --session \
         --dest org.gnome.Mutter.IdleMonitor \
         --object-path /org/gnome/Mutter/IdleMonitor/Core \
-        --method org.gnome.Mutter.IdleMonitor.GetIdletime 2>/dev/null) \
-        || { vlog "gdbus GetIdletime failed, defaulting to 0"; echo 0; return; }
-    # raw is like: (uint64 12345,)
-    raw="${raw#*(uint64 }"
-    local ms="${raw%,)*}"
+        --method org.gnome.Mutter.IdleMonitor.GetIdletime 2>/dev/null) || {
+        # A failed read isn't evidence the user is present. Treating it as 0
+        # would look like a wake event and could trigger a false lock.
+        vlog "gdbus GetIdletime failed, reusing last known idle (${LAST_IDLE_MS}ms)"
+        echo "$LAST_IDLE_MS"
+        return
+    }
+    local ms
+    ms=$(parse_idle_reply "$raw")
     vlog "idle=${ms}ms (threshold=${IDLE_TIMEOUT_MS}ms)"
+    LAST_IDLE_MS="$ms"
     echo "$ms"
+}
+
+# Whether GNOME's own screensaver/lock is already active. Checked before
+# launching so a second gitlogue instance never starts behind an existing
+# lock screen while idle time keeps climbing during that lock.
+is_screen_locked() {
+    local raw
+    raw=$(gdbus call --session \
+        --dest org.gnome.ScreenSaver \
+        --object-path /org/gnome/ScreenSaver \
+        --method org.gnome.ScreenSaver.GetActive 2>/dev/null) || { echo false; return; }
+    parse_lock_reply "$raw"
 }
 
 inhibit_gnome_idle() {
@@ -66,17 +143,17 @@ uninhibit_gnome_idle() {
 launch_screensaver() {
     log "Launching gitlogue screensaver (repo: ${REPO_PATH})"
     vlog "Command: ${GITLOGUE} --loop --path ${REPO_PATH} ${GITLOGUE_FLAGS}"
-    # bash -c wrapper: exec replaces bash, so PID_FILE ends up with gitlogue's PID
+    # exec inside bash -c replaces bash, so PID_FILE ends up holding gitlogue's own PID.
     gnome-terminal \
         --full-screen --hide-menubar --title "gitscrnsvr" \
         -- bash -c "echo \$\$ > ${PID_FILE}; exec ${GITLOGUE} --loop --path ${REPO_PATH} ${GITLOGUE_FLAGS}" &
     local waited=0
     while [[ ! -f "${PID_FILE}" ]] && [[ $waited -lt 50 ]]; do
         sleep 0.1
-        waited=$((waited + 1))   # avoid (( )) exit-code-0 trap under set -e
+        waited=$((waited + 1))   # avoid (( )) returning exit code 0 under set -e
     done
     if [[ ! -f "${PID_FILE}" ]]; then
-        log "WARNING: PID file not written within 5s — gnome-terminal may have failed"
+        log "WARNING: PID file not written within 5s, gnome-terminal may have failed"
     else
         vlog "gitlogue PID=$(cat ${PID_FILE})"
     fi
@@ -86,18 +163,24 @@ kill_screensaver() {
     [[ ! -f "${PID_FILE}" ]] && return 0
     local pid
     pid=$(cat "${PID_FILE}" 2>/dev/null || echo "")
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        kill -TERM "$pid" 2>/dev/null || true
-        sleep 1
-        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
-    fi
     rm -f "${PID_FILE}"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null || return 0
+
+    kill -TERM "$pid" 2>/dev/null || true
+    # Poll instead of a flat sleep so we return the moment it's actually
+    # gone, up to the same 1s grace period before escalating to SIGKILL.
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 10 ]]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
 }
 
 lock_and_dismiss() {
-    log "Input detected — locking screen"
-    # Lock FIRST: GNOME Shell renders the lock screen before the terminal disappears,
-    # preventing a brief desktop flash.
+    log "Input detected, locking screen"
+    # Lock first: GNOME Shell renders the lock screen before the terminal
+    # disappears, so there's no brief flash of the desktop underneath.
     gdbus call --session \
         --dest org.gnome.ScreenSaver \
         --object-path /org/gnome/ScreenSaver \
@@ -107,86 +190,213 @@ lock_and_dismiss() {
     kill_screensaver
 }
 
-# ─── STARTUP VALIDATION ───────────────────────────────────────────────────────
+do_update() {
+    log "Checking for updates..."
+    local api_url="https://api.github.com/repos/${REPO_SLUG}/releases/latest"
+    local response
+    response=$(curl -fsSL "$api_url" 2>&1) || {
+        echo "ERROR: Could not reach GitHub API (${api_url})." >&2
+        echo "       ${response}" >&2
+        exit 1
+    }
 
-log "Validating configuration..."
-vlog "REPO_PATH=${REPO_PATH}"
-vlog "GITLOGUE=${GITLOGUE}"
-vlog "IDLE_TIMEOUT_MS=${IDLE_TIMEOUT_MS}"
-vlog "WAKE_THRESHOLD_MS=${WAKE_THRESHOLD_MS}"
-vlog "PID_FILE=${PID_FILE}"
+    local latest
+    latest=$(parse_release_tag "$response")
+    if [[ -z "$latest" ]]; then
+        echo "ERROR: Could not determine latest release version from GitHub API response." >&2
+        exit 1
+    fi
 
-if [[ ! -x "$GITLOGUE" ]]; then
-    echo "ERROR: gitlogue not found or not executable at '${GITLOGUE}'." >&2
-    exit 1
-fi
-vlog "gitlogue binary: OK"
+    if [[ "$latest" == "$VERSION" ]]; then
+        log "Already up to date (v${VERSION})."
+        exit 0
+    fi
+    if [[ "$(newer_version "$VERSION" "$latest")" == "$VERSION" ]]; then
+        log "Installed version (v${VERSION}) is newer than the latest release (v${latest})."
+        exit 0
+    fi
 
-if ! git -C "$REPO_PATH" rev-parse --git-dir &>/dev/null; then
-    echo "ERROR: REPO_PATH='${REPO_PATH}' is not a git repository." >&2
-    echo "       Edit the REPO_PATH variable at the top of this script." >&2
-    exit 1
-fi
-vlog "git repo: OK"
+    log "Update available: v${VERSION} -> v${latest}"
+    echo "Release notes: https://github.com/${REPO_SLUG}/releases/tag/v${latest}"
+    if [[ "$UPDATE_YES" != "true" ]]; then
+        read -rp "Update to v${latest}? [y/N] " reply
+        [[ "$reply" =~ ^[Yy]$ ]] || { log "Update cancelled."; exit 0; }
+    fi
 
-local_idle_ms=$(gdbus call --session \
-    --dest org.gnome.Mutter.IdleMonitor \
-    --object-path /org/gnome/Mutter/IdleMonitor/Core \
-    --method org.gnome.Mutter.IdleMonitor.GetIdletime 2>&1) || {
-    echo "ERROR: Cannot reach org.gnome.Mutter.IdleMonitor via D-Bus." >&2
-    echo "       D-Bus response: ${local_idle_ms}" >&2
-    echo "       This script requires a running GNOME session." >&2
-    exit 1
-}
-vlog "D-Bus IdleMonitor: OK (response: ${local_idle_ms})"
+    local base_url="https://github.com/${REPO_SLUG}/releases/download/v${latest}"
+    local self_path
+    self_path=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
+    local tmp_script
+    tmp_script=$(mktemp)
+    if ! curl -fsSL "${base_url}/gitscrnsvr" -o "$tmp_script"; then
+        echo "ERROR: Failed to download gitscrnsvr v${latest}." >&2
+        rm -f "$tmp_script"
+        exit 1
+    fi
+    if ! head -1 "$tmp_script" | grep -q '^#!.*bash'; then
+        echo "ERROR: Downloaded file doesn't look like a bash script, aborting update." >&2
+        rm -f "$tmp_script"
+        exit 1
+    fi
 
-# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
+    local service_was_active=false
+    if systemctl --user is-active --quiet gitscrnsvr.service 2>/dev/null; then
+        service_was_active=true
+        log "Stopping gitscrnsvr.service before replacing the running script..."
+        systemctl --user stop gitscrnsvr.service
+    fi
 
-INHIBIT_COOKIE=""
-SCREENSAVER_ACTIVE=false
-SCREENSAVER_START=0
+    chmod +x "$tmp_script"
+    mv "$tmp_script" "$self_path"
+    log "Updated gitscrnsvr to v${latest} at ${self_path}"
 
-trap 'kill_screensaver; uninhibit_gnome_idle "${INHIBIT_COOKIE}"; exit 0' \
-    EXIT SIGTERM SIGINT SIGHUP
-
-log "All checks passed. Starting main loop."
-log "Idle threshold: ${IDLE_TIMEOUT_MS}ms  |  Repo: ${REPO_PATH}"
-$VERBOSE && log "Verbose mode ON — idle time printed every poll cycle"
-
-while true; do
-    idle_ms=$(get_idle_ms)
-
-    if [[ "$SCREENSAVER_ACTIVE" == "false" ]]; then
-        if (( idle_ms >= IDLE_TIMEOUT_MS )); then
-            log "Idle threshold reached (${idle_ms}ms)"
-            INHIBIT_COOKIE=$(inhibit_gnome_idle)
-            launch_screensaver
-            SCREENSAVER_ACTIVE=true
-            SCREENSAVER_START=$SECONDS
-            vlog "Grace period: ignoring idle resets for ${LAUNCH_GRACE_SEC}s"
+    local service_file="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user/gitscrnsvr.service"
+    if [[ -f "$service_file" ]]; then
+        if curl -fsSL "${base_url}/gitscrnsvr.service" -o "${service_file}.new" 2>/dev/null; then
+            mv "${service_file}.new" "$service_file"
+            systemctl --user daemon-reload
+            log "Updated gitscrnsvr.service"
         else
-            sleep "$POLL_INTERVAL"
-        fi
-    else
-        local_elapsed=$(( SECONDS - SCREENSAVER_START ))
-        if (( idle_ms < WAKE_THRESHOLD_MS )) && (( local_elapsed >= LAUNCH_GRACE_SEC )); then
-            vlog "Wake detected after ${local_elapsed}s (idle=${idle_ms}ms)"
-            lock_and_dismiss
-            uninhibit_gnome_idle "${INHIBIT_COOKIE}"
-            INHIBIT_COOKIE=""
-            SCREENSAVER_ACTIVE=false
-            sleep 5
-        else
-            # Restart gitlogue if it crashed unexpectedly
-            if [[ -f "${PID_FILE}" ]]; then
-                local_pid=$(cat "${PID_FILE}" 2>/dev/null || echo "")
-                if [[ -n "$local_pid" ]] && ! kill -0 "$local_pid" 2>/dev/null; then
-                    log "gitlogue exited unexpectedly — restarting"
-                    rm -f "${PID_FILE}"
-                    launch_screensaver
-                fi
-            fi
-            sleep "$WAKE_POLL_INTERVAL"
+            rm -f "${service_file}.new"
         fi
     fi
-done
+
+    if $service_was_active; then
+        systemctl --user start gitscrnsvr.service
+        log "Restarted gitscrnsvr.service"
+    fi
+
+    log "Update complete: v${VERSION} -> v${latest}"
+    exit 0
+}
+
+validate_environment() {
+    log "Validating configuration..."
+    vlog "REPO_PATH=${REPO_PATH}"
+    vlog "IDLE_TIMEOUT_MS=${IDLE_TIMEOUT_MS}"
+    vlog "WAKE_THRESHOLD_MS=${WAKE_THRESHOLD_MS}"
+    vlog "PID_FILE=${PID_FILE}"
+
+    if ! GITLOGUE="$(find_gitlogue)"; then
+        echo "ERROR: gitlogue not found on PATH or in any known install location." >&2
+        echo "       Install it, then re-run, see: ${GITLOGUE_INSTALL_DOCS}" >&2
+        echo "       Or set GITLOGUE=/path/to/gitlogue in ${CONFIG_FILE}" >&2
+        exit 1
+    fi
+    vlog "gitlogue binary: OK (${GITLOGUE})"
+
+    if ! git -C "$REPO_PATH" rev-parse --git-dir &>/dev/null; then
+        echo "ERROR: REPO_PATH='${REPO_PATH}' is not a git repository." >&2
+        echo "       Set REPO_PATH in ${CONFIG_FILE}" >&2
+        exit 1
+    fi
+    vlog "git repo: OK"
+
+    local idle_check
+    idle_check=$(gdbus call --session \
+        --dest org.gnome.Mutter.IdleMonitor \
+        --object-path /org/gnome/Mutter/IdleMonitor/Core \
+        --method org.gnome.Mutter.IdleMonitor.GetIdletime 2>&1) || {
+        echo "ERROR: Cannot reach org.gnome.Mutter.IdleMonitor via D-Bus." >&2
+        echo "       D-Bus response: ${idle_check}" >&2
+        echo "       This script requires a running GNOME session." >&2
+        exit 1
+    }
+    vlog "D-Bus IdleMonitor: OK (response: ${idle_check})"
+}
+
+run_daemon() {
+    INHIBIT_COOKIE=""
+    SCREENSAVER_ACTIVE=false
+    SCREENSAVER_START=0
+
+    trap 'kill_screensaver; uninhibit_gnome_idle "${INHIBIT_COOKIE}"; exit 0' \
+        EXIT SIGTERM SIGINT SIGHUP
+
+    log "All checks passed. Starting main loop."
+    log "Idle threshold: ${IDLE_TIMEOUT_MS}ms  |  Repo: ${REPO_PATH}"
+    $VERBOSE && log "Verbose mode ON, idle time printed every poll cycle"
+
+    while true; do
+        idle_ms=$(get_idle_ms)
+
+        if [[ "$SCREENSAVER_ACTIVE" == "false" ]]; then
+            if [[ "$(is_screen_locked)" == "true" ]]; then
+                # Already locked (by us, by Super+L, by suspend). Idle time
+                # keeps climbing while locked, so skip launching to avoid a
+                # second gitlogue instance starting behind the lock screen.
+                vlog "Screen already locked, waiting for unlock before re-checking idle"
+                sleep "$POLL_INTERVAL"
+            elif (( idle_ms >= IDLE_TIMEOUT_MS )); then
+                log "Idle threshold reached (${idle_ms}ms)"
+                INHIBIT_COOKIE=$(inhibit_gnome_idle)
+                launch_screensaver
+                SCREENSAVER_ACTIVE=true
+                SCREENSAVER_START=$SECONDS
+                vlog "Grace period: ignoring idle resets for ${LAUNCH_GRACE_SEC}s"
+            else
+                sleep "$POLL_INTERVAL"
+            fi
+        else
+            local_elapsed=$(( SECONDS - SCREENSAVER_START ))
+            if (( idle_ms < WAKE_THRESHOLD_MS )) && (( local_elapsed >= LAUNCH_GRACE_SEC )); then
+                vlog "Wake detected after ${local_elapsed}s (idle=${idle_ms}ms)"
+                lock_and_dismiss
+                uninhibit_gnome_idle "${INHIBIT_COOKIE}"
+                INHIBIT_COOKIE=""
+                SCREENSAVER_ACTIVE=false
+                sleep 5
+            else
+                # Restart gitlogue if it crashed unexpectedly.
+                if [[ -f "${PID_FILE}" ]]; then
+                    local_pid=$(cat "${PID_FILE}" 2>/dev/null || echo "")
+                    if [[ -n "$local_pid" ]] && ! kill -0 "$local_pid" 2>/dev/null; then
+                        log "gitlogue exited unexpectedly, restarting"
+                        rm -f "${PID_FILE}"
+                        launch_screensaver
+                    fi
+                fi
+                sleep "$WAKE_POLL_INTERVAL"
+            fi
+        fi
+    done
+}
+
+usage() {
+    cat <<EOF
+Usage: gitscrnsvr [options|command]
+
+Options / commands (flag and bare-word forms both work):
+  -v, --verbose, verbose   Print idle time and extra detail on every poll cycle
+  -V, --version, version   Print version and exit
+  --update, update         Check for and install a newer release, then exit
+  -y, --yes                With --update/update, skip the confirmation prompt
+  -h, --help, help         Show this help
+EOF
+}
+
+main() {
+    VERBOSE=false
+    DO_UPDATE=false
+    UPDATE_YES=false
+
+    for arg in "$@"; do
+        case "$arg" in
+            -v|--verbose|verbose) VERBOSE=true ;;
+            -V|--version|version) echo "gitscrnsvr ${VERSION}"; exit 0 ;;
+            -h|--help|help) usage; exit 0 ;;
+            --update|update) DO_UPDATE=true ;;
+            -y|--yes) UPDATE_YES=true ;;
+            *) echo "Unknown option: $arg" >&2; exit 1 ;;
+        esac
+    done
+
+    $DO_UPDATE && do_update
+
+    validate_environment
+    run_daemon
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
