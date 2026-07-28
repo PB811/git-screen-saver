@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify tag matches VERSION in gitscrnsvr
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          script_version="$(grep -oP '(?<=^VERSION=")[^"]+' gitscrnsvr)"
+          if [[ "$tag" != "$script_version" ]]; then
+            echo "::error::Tag v${tag} does not match VERSION=\"${script_version}\" in gitscrnsvr"
+            exit 1
+          fi
+          echo "Tag matches gitscrnsvr VERSION: ${script_version}"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            gitscrnsvr
+            gitscrnsvr.service
+            install.sh
+            uninstall.sh
